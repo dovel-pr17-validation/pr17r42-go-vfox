@@ -1,0 +1,412 @@
+# Create a Plugin
+
+## What's in the plugin?
+
+The directory structure is as follows:
+
+```shell
+    .
+    ├── README.md
+    ├── LICENSE
+    └── hooks
+        └── available.lua
+        └── env_keys.lua
+        └── post_install.lua
+        └── pre_install.lua
+        ....
+    └── lib
+        └── xxx.lua
+        └── xxx.lua
+        └── xxx.lua
+    └── metadata.lua
+
+```
+
+- `hooks` directory is used to store the plugin's hook functions. **One hook function corresponds to one `.lua` file.**
+- `lib` directory is used to store the plugin's dependent libraries. `vfox` will automatically load all `.lua` files in this directory. **If placed in other directories, it will not be loaded.**
+- `metadata.lua` Plugin metadata information. Used to describe the basic information of the plugin, such as the plugin name, version, etc.
+- `README.md` Plugin documentation.
+- `LICENSE` Plugin license.
+-
+
+::: warning Plugin template
+To facilitate the development of plugins, we provide a plugin template that you can use directly [vfox-plugin-template](https://github.com/version-fox/vfox-plugin-template) to develop a plugin.
+:::
+
+## Hooks Overview
+
+The full list of hooks callable from vfox.
+
+| Hook                                            | **Required** | Description                                                                     |
+| :---------------------------------------------- | :----------- | :------------------------------------------------------------------------------ |
+| [hooks/available.lua](#available)               | ✅           | List all available versions                                                     |
+| [hooks/pre_install.lua](#preinstall)            | ✅           | Parse version and return pre-installation information                           |
+| [hooks/env_keys.lua](#envkeys)                  | ✅           | Configure environment variables                                                 |
+| [hooks/post_install.lua](#postinstall)          | ❌           | Execute additional operations after install, such as compiling source code, etc |
+| [hooks/pre_use.lua](#preuse)                    | ❌           | An opportunity to change the version before using it                            |
+| [hooks/parse_legacy_file.lua](#parselegacyfile) | ❌           | Custom parser for legacy version files                                          |
+| [hooks/pre_uninstall.lua](#preuninstall)        | ❌           | Perform some operations before uninstalling targeted version                    |
+| [hooks/fingerprint.lua](#fingerprint)           | ❌           | Report the facts that identify an installation, so changes made to it show up   |
+| [hooks/detect.lua](#detect)                     | ❌           | Find SDKs on this machine that `vfox` did not install, for `vfox link --detect` |
+
+## Required hook functions
+
+### PreInstall
+
+This hook function is called before the installation of the SDK. It is used to return the pre-installation information,
+such as
+the specific version, download source, and other information. `vfox` will help you download these files to a specific
+directory
+in advance. If it is a compressed package such as `tar`, `tar.gz`, `tar.xz`, `zip`, `vfox` will help you to decompress
+it directly.
+
+By default, `vfox` reads the file name from the URL. If the last item in the URL is not a valid file name, you should
+specify the file name by appending a fragment at the end, so that `vfox` can identify the file format and decompress it.
+For example: `https://example.com/1234567890#/filename.zip`.
+
+if the return value of version is empty, it means that the version is not found, and `vfox` will ask the user whether to perform a search operation.
+
+```lua
+function PLUGIN:PreInstall(ctx)
+    --- input parameters
+    local version = ctx.version
+    --- the current version of vfox running
+    local runtimeVersion = ctx.runtimeVersion
+    return {
+        --- sdk version
+        version = "xxx",
+        --- remote URL or local file path [optional]
+        url = "xxx",
+        --- request headers for remote URL [optional]
+        headers = {
+            ["xxx"] = "xxx",
+        },
+        --- note information [optional]
+        note = "xxx",
+        --- SHA256 checksum [optional]
+        sha256 = "xxx",
+        --- md5 checksum [optional]
+        md5 = "xxx",
+        --- sha1 checksum [optional]
+        sha1 = "xxx",
+        --- sha512 checksum [optional]
+        sha512 = "xxx",
+        --- additional files [optional]
+        addition = {
+            {
+                --- additional file name !
+                name = "xxx",
+                --- other same as above
+                ...
+            }
+        }
+    }
+end
+```
+
+### Available
+
+This hook function is called when the `vfox search` command is executed. It is used to return the current available
+version
+list. If there is no version, return an empty array.
+
+```lua
+function PLUGIN:Available(ctx)
+    --- input parameters, array
+    local args = ctx.args
+    return {
+        {
+            version = "xxxx",
+            note = "LTS",
+            addition = {
+                {
+                    name = "npm",
+                    version = "8.8.8",
+                }
+            }
+        }
+    }
+end
+```
+
+::: warning Cache
+
+`vfox` will cache the results of the `Available` hook to reduce the number of network requests. The default cache time is
+`12h`. For details, see [Cache Settings](../../guides/configuration.md#cache-settings).
+
+:::
+
+### EnvKeys
+
+It is used to return the environment variables that need to be configured when using the SDK.
+
+```lua
+function PLUGIN:EnvKeys(ctx)
+    --- this variable is same as ctx.sdkInfo['plugin-name'].path
+    local mainPath = ctx.path
+    local runtimeVersion = ctx.runtimeVersion
+    local sdkInfo = ctx.sdkInfo['sdk-name']
+    local path = sdkInfo.path
+    local version = sdkInfo.version
+    local name = sdkInfo.name
+    return {
+        {
+            key = "JAVA_HOME",
+            value = mainPath
+        },
+        --- NOTE: If you need to set multiple PATH paths, just pass multiple PATHs, vfox will automatically deduplicate and set them in the order of configuration
+        {
+            key = "PATH",
+            value = mainPath .. "/bin"
+        },
+        {
+            key = "PATH",
+            value = mainPath .. "/bin2"
+        }
+    }
+end
+```
+
+## Optional hook functions
+
+::: warning
+You must delete the corresponding `.lua` file if you do not need these hook functions!
+:::
+
+### PostInstall
+
+This hook function is called after the `PreInstall` function is executed. It is used to execute additional operations,
+such
+as compiling source code, etc. Implement as needed.
+
+```lua
+function PLUGIN:PostInstall(ctx)
+    --- SDK installation root path
+    local rootPath = ctx.rootPath
+    local runtimeVersion = ctx.runtimeVersion
+    ---  Get it from the name returned by PreInstall
+    local sdkInfo = ctx.sdkInfo['sdk-name']
+    local path = sdkInfo.path
+    local version = sdkInfo.version
+    local name = sdkInfo.name
+end
+```
+
+### PreUse
+
+When the user uses `vfox use`, the plugin's `PreUse` function is called. The purpose of this function is to return the
+version information entered by the user. If the `PreUse` function returns version information, `vfox` will use this new
+version.
+
+```lua
+function PLUGIN:PreUse(ctx)
+    local runtimeVersion = ctx.runtimeVersion
+    --- user input version
+    local version = ctx.version
+    --- user current used version
+    local previousVersion = ctx.previousVersion
+
+    --- installed sdks (keyed by version string)
+    --- For example, if you have version "1.19.2" installed, use:
+    --- local sdkInfo = ctx.installedSdks['1.19.2']
+    local sdkInfo = ctx.installedSdks[version]
+    local path = sdkInfo.path
+    local name = sdkInfo.name
+    local sdkVersion = sdkInfo.version
+
+    --- working directory
+    local cwd = ctx.cwd
+
+    --- user input scope
+    --- could be one of global/project/session
+    local scope = ctx.scope
+
+    --- return the version information
+    return {
+        version = sdkVersion,
+    }
+end
+```
+
+### ParseLegacyFile
+
+This hook is used to parse other configuration files to determine the version of the tool. For example, the
+`.nvmrc` file of `nvm`, the `.sdkmanrc` file of `SDKMAN`, etc.
+
+::: danger
+This hook must be used with the `legacyFilenames` configuration item to tell `vfox` which files your plugin can parse.
+:::
+
+::: tip Strategy Configuration
+When implementing this hook function, you can access the user-configured parsing strategy through `ctx.strategy`. For detailed strategy configuration, please refer to the [Configuration Documentation](../../guides/configuration.md#legacy-version-file).
+:::
+
+**location**: `metadata.lua`
+
+```lua
+--- The list of legacy file names that the current plugin supports parsing, such as: .nvmrc, .node-version, .sdkmanrc
+PLUGIN.legacyFilenames = {
+    '.nvmrc',
+    '.node-version',
+}
+```
+
+**location**: `hooks/parse_legacy_file.lua`
+
+```lua
+function PLUGIN:ParseLegacyFile(ctx)
+    local filename = ctx.filename
+    local filepath = ctx.filepath
+    --- Parsing strategy (latest_installed, latest_available, specified)
+    local strategy = ctx.strategy
+    --- Get the list of versions of the current plugin installed
+    local versions = ctx:getInstalledVersions()
+
+    return {
+        --- need to return the specific version
+        version = "x.y.z"
+    }
+end
+```
+
+### PreUninstall
+
+This is called before the SDK is uninstalled. If the plugin needs to perform some operations before
+uninstalling, it can implement this hook function. For example, cleaning up the cache, deleting configuration files, etc.
+
+**Location**: `hooks/pre_uninstall.lua`
+
+```lua
+function PLUGIN:PreUninstall(ctx)
+    local mainSdkInfo = ctx.main
+    local mainPath = mainSdkInfo.path
+    local mversion = mainSdkInfo.version
+    local mname = mainSdkInfo.name
+    --- Other SDK information, the `addition` field returned in PreInstall, obtained by name
+    local sdkInfo = ctx.sdkInfo['sdk-name']
+    local path = sdkInfo.path
+    local version = sdkInfo.version
+    local name = sdkInfo.name
+end
+```
+
+### Fingerprint
+
+Some SDKs change themselves after they are installed: `flutter upgrade` moves its git checkout to another commit,
+`npm install -g npm` replaces npm. `vfox` manages versions by directory, so by itself it cannot tell that
+`flutter@3.47.4` is no longer 3.47.4.
+
+This hook returns the facts that identify an installation. `vfox` calls it right after an installation (and after
+`vfox link`) and keeps the result in the version's receipt. `vfox use` and `vfox doctor` call it again and warn when the
+facts are no longer the same, with the same message and the same way out (`vfox install --reinstall`) for every plugin.
+
+Return only what identifies the SDK itself. Changes the user is meant to make, such as global packages, must not be part of it.
+Return `nil` when there is nothing to check.
+
+::: warning
+The hook runs on every `vfox use`. It must only read, must not use the network, and must be fast (well under 50 ms).
+Reading a few files is the way to go; starting processes is not.
+:::
+
+**Location**: `hooks/fingerprint.lua`
+
+```lua
+function PLUGIN:Fingerprint(ctx)
+    --- main runtime directory
+    local path = ctx.path
+    local version = ctx.version
+    --- other SDK information, same as in PostInstall
+    local sdkInfo = ctx.sdkInfo['sdk-name']
+
+    --- A flat table of facts. Values are compared as text.
+    return {
+        facts = {
+            head = read_git_head(path),
+        },
+    }
+end
+```
+
+::: tip Linked SDKs
+Facts are also recorded for an SDK registered with `vfox link`, but a change in them is only a notice there:
+`vfox` does not own that SDK.
+:::
+
+### Detect
+
+This hook finds SDKs that are already on the machine and that `vfox` did not install, such as the JDKs of the system
+package manager, of an IDE or of a CI runner. `vfox link --detect <sdk>` calls it and links what it returns.
+
+Return the SDK directory (the one `EnvKeys` expects as `ctx.path`) and the name to link it under. The name is used as
+written, so make it something a user would type, like `21.0.3-tem`. It may contain letters, digits, `.`, `_`, `+` and
+`-`, and must not be `latest`. Entries that are already linked or installed are skipped by `vfox`.
+
+**Location**: `hooks/detect.lua`
+
+```lua
+function PLUGIN:Detect(ctx)
+    local found = {}
+    for _, home in ipairs(candidate_homes()) do
+        local release = read_release_file(home)
+        if release then
+            table.insert(found, {
+                version = release.version .. "-" .. release.vendor,
+                path = home,
+                note = "found in " .. home, -- optional
+            })
+        end
+    end
+    return found
+end
+```
+
+### shadowHints
+
+This is metadata, not a hook. After `vfox use`, `vfox` tells the user when a command of the SDK is not the one that runs
+because another executable sits earlier in `PATH`. A plugin knows the usual culprits, so it can say what to do about them.
+Each entry matches part of the path of the shadowing executable (case-insensitive) and adds a message and, optionally, a link.
+
+**Location**: `metadata.lua`
+
+```lua
+PLUGIN.shadowHints = {
+    {
+        match = "pnpm",
+        message = "pnpm installed its own node. Run `pnpm remove -g node`.",
+        url = "https://github.com/version-fox/vfox-nodejs/blob/main/docs/pnpm.md",
+    },
+}
+```
+
+Detecting the shadowing itself is done by `vfox` for every plugin; there is no need to scan `PATH` in `PreUse`.
+
+## Test Plugin
+
+Run Lua assertions against your local plugin without installing it:
+
+```shell
+vfox plugin test .
+vfox plugin run . PreInstall --input '{"version":"latest"}' --json
+```
+
+See [Test and debug a plugin](./testing.md) for HTTP fixtures, environment overrides, all hook inputs, and CI execution boundaries. Run real installations in disposable CI runners or VMs.
+
+## Example
+
+Here is an example of a plugin that supports the `Node.js`.
+
+https://github.com/version-fox/vfox-nodejs
+
+You can refer to this plugin to develop your own plugin.
+
+## Publish to the public registry
+
+`vfox` allows custom installation of plugins, such as:
+
+```shell
+vfox add --source https://github.com/version-fox/vfox-nodejs/releases/download/v0.0.5/vfox-nodejs_0.0.5.zip
+```
+
+In order to make it easier for your users, you can add the plugin to the public registry to list your plugin and easily install it with shorter commands, such as `vfox add nodejs`.
+
+For details, see [How to submit a plugin to the public registry](./howto_registry.md).

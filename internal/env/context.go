@@ -1,0 +1,160 @@
+/*
+ *
+ *    Copyright 2026 Han Li and contributors
+ *
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *    Unless required by applicable law or agreed to in writing, software
+ *    distributed under the License is distributed on an "AS IS" BASIS,
+ *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *    See the License for the specific language governing permissions and
+ *    limitations under the License.
+ *
+ */
+
+package env
+
+import (
+	"fmt"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+
+	"github.com/version-fox/vfox/internal/config"
+	"github.com/version-fox/vfox/internal/pathmeta"
+)
+
+// RuntimeEnvContext represents the runtime environment context.
+type RuntimeEnvContext struct {
+	UserConfig        *config.Config     // UserConfig holds the user configuration.
+	CurrentWorkingDir string             // CurrentWorkingDir is the current working directory.
+	PathMeta          *pathmeta.PathMeta // PathMeta holds the path info of the environment.
+	RuntimeVersion    string             // RuntimeVersion is the version of vfox
+}
+
+// LoadVfoxTomlByScope loads the config for the specified scope
+// pathmeta is not aware of scope, but we don't need to track it in VfoxToml
+func (m *RuntimeEnvContext) LoadVfoxTomlByScope(scope UseScope) (*pathmeta.VfoxToml, error) {
+	var dir string
+
+	switch scope {
+	case Global:
+		dir = m.PathMeta.User.Home
+	case Project:
+		dir = m.PathMeta.Working.Directory
+	case Session:
+		dir = m.PathMeta.Working.SessionSdkDir
+	default:
+		return nil, fmt.Errorf("unknown scope: %v", scope)
+	}
+
+	return pathmeta.LoadConfig(dir)
+}
+
+// LoadVfoxTomlChainByScopes loads configs for multiple scopes and returns a chain
+// Scopes are added in order (first added = lowest priority)
+// Example: LoadVfoxTomlChainByScopes(Global, Session, Project) → Project has highest priority
+func (m *RuntimeEnvContext) LoadVfoxTomlChainByScopes(scopes ...UseScope) (VfoxTomlChain, error) {
+	chain := NewVfoxTomlChain()
+
+	for _, scope := range scopes {
+		c, err := m.LoadVfoxTomlByScope(scope)
+		if err != nil {
+			return chain, err
+		}
+		chain.Add(c, scope)
+	}
+
+	return chain, nil
+}
+
+// HttpClient creates an HTTP client based on the proxy settings in the user configuration.
+func (m *RuntimeEnvContext) HttpClient() *http.Client {
+	var client *http.Client
+	if m.UserConfig.Proxy.Enable {
+		if uri, err := url.Parse(m.UserConfig.Proxy.Url); err == nil {
+			transPort := &http.Transport{
+				Proxy: http.ProxyURL(uri),
+			}
+			client = &http.Client{
+				Transport: transPort,
+			}
+		}
+	} else {
+		client = http.DefaultClient
+	}
+
+	return client
+}
+
+// GetLinkDirPathByScope returns the symlink directory path for the given scope.
+func (m *RuntimeEnvContext) GetLinkDirPathByScope(scope UseScope) string {
+	var linkDir string
+	switch scope {
+	case Global:
+		linkDir = m.PathMeta.Working.GlobalSdkDir
+	case Project:
+		linkDir = m.PathMeta.Working.ProjectSdkDir
+		// In the home directory the project link directory is the global one;
+		// linking project versions there would repoint the global links that
+		// every other shell uses, so they go to the session directory instead.
+		if sameDir(linkDir, m.PathMeta.Working.GlobalSdkDir) {
+			linkDir = m.PathMeta.Working.SessionSdkDir
+		}
+	case Session:
+		linkDir = m.PathMeta.Working.SessionSdkDir
+	}
+	return linkDir
+}
+
+// sameDir reports whether a and b name the same directory. Paths that are
+// equal as text match without touching the file system; otherwise both are
+// compared with os.SameFile, so a symlink, another case on a case-insensitive
+// volume or another spelling of the drive letter does not matter.
+func sameDir(a, b string) bool {
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true
+	}
+	ai, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	bi, err := os.Stat(b)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(ai, bi)
+}
+
+// CleanSystemPaths returns system PATH with all vfox-managed paths removed (prefix match).
+// This ensures the system PATH is clean before adding vfox paths back in priority order.
+func (m *RuntimeEnvContext) CleanSystemPaths() *Paths {
+	_, cleanPaths := m.SplitSystemPaths()
+	return cleanPaths
+}
+
+// PathPolicyKey identifies the PATH ordering policy in effect: the `path.mode`
+// setting, the directories `path.preserve` expands to and those of an active
+// virtualenv or conda environment. Output cached under another key is stale
+// even when the PATH and the version files are as they were.
+func (m *RuntimeEnvContext) PathPolicyKey() string {
+	return m.pathPolicy().key()
+}
+
+// SplitSystemPaths splits the current PATH into two parts:
+// 1. prefixPaths: paths that appear BEFORE the first vfox-managed path and stay in front of it
+// 2. cleanPaths: remaining non-vfox paths (lower priority than vfox)
+//
+// This preserves the priority of paths like Python virtual environments that users activate
+// after vfox has set up the environment. Which of the entries in front of vfox's directories
+// count as such is decided by the `path.mode` setting: "baseline" (the default) keeps only
+// those added after `vfox activate` ran, "legacy" keeps all of them, and "aggressive" keeps
+// only active virtualenv/conda directories and `path.preserve`.
+func (m *RuntimeEnvContext) SplitSystemPaths() (prefixPaths *Paths, cleanPaths *Paths) {
+	return splitSystemPaths(os.Getenv("PATH"), m.pathPolicy())
+}

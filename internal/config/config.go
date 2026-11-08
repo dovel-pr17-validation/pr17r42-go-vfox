@@ -1,0 +1,449 @@
+/*
+ *    Copyright 2026 Han Li and contributors
+ *
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *    Unless required by applicable law or agreed to in writing, software
+ *    distributed under the License is distributed on an "AS IS" BASIS,
+ *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *    See the License for the specific language governing permissions and
+ *    limitations under the License.
+ */
+
+package config
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/version-fox/vfox/internal/shared/util"
+	"gopkg.in/yaml.v3"
+)
+
+type Config struct {
+	Plugin            Plugin             `yaml:"plugin"`
+	Proxy             *Proxy             `yaml:"proxy"`
+	Storage           *Storage           `yaml:"storage"`
+	Registry          *Registry          `yaml:"registry"`
+	LegacyVersionFile *LegacyVersionFile `yaml:"legacyVersionFile"`
+	Cache             *Cache             `yaml:"cache"`
+	Gitignore         *Gitignore         `yaml:"gitignore"`
+	Diagnostics       *Diagnostics       `yaml:"diagnostics"`
+	Path              *Path              `yaml:"path"`
+	// Aliases maps an SDK name to user-defined names for installed versions:
+	// aliases[sdk][alias] = version. They are resolved for command-line input
+	// only and are never written to version files.
+	Aliases map[string]map[string]string `yaml:"aliases"`
+}
+
+const filename = "config.yaml"
+
+var (
+	DefaultConfig = &Config{
+		Plugin:            Plugin{HTTP: &HTTP{}},
+		Proxy:             EmptyProxy,
+		Storage:           EmptyStorage,
+		Registry:          EmptyRegistry,
+		LegacyVersionFile: EmptyLegacyVersionFile,
+		Cache:             EmptyCache,
+		Gitignore:         EmptyGitignore,
+		Diagnostics:       EmptyDiagnostics,
+		Path:              EmptyPath,
+	}
+)
+
+// Clone returns a copy that can be modified without touching c or the shared
+// defaults (NewConfigWithPath may hand out DefaultConfig itself).
+func (c *Config) Clone() *Config {
+	if c == nil {
+		return &Config{}
+	}
+	clone := *c
+	clone.Aliases = cloneAliases(c.Aliases)
+	return &clone
+}
+
+func cloneAliases(aliases map[string]map[string]string) map[string]map[string]string {
+	if aliases == nil {
+		return nil
+	}
+	clone := make(map[string]map[string]string, len(aliases))
+	for sdk, names := range aliases {
+		clone[sdk] = make(map[string]string, len(names))
+		for name, version := range names {
+			clone[sdk][name] = version
+		}
+	}
+	return clone
+}
+
+// setOnDemand lists the sections a config file only holds once somebody set
+// them. A section the user's file declares replaces the shared one, so a file
+// that vfox creates must not declare these with their defaults: the first run
+// would otherwise pin them for good and a shared VFOX_HOME could no longer
+// decide them. A new section of this kind belongs in this list.
+var setOnDemand = map[string]bool{"diagnostics": true, "path": true, "aliases": true}
+
+// newFileContent is what a config file vfox creates holds: the defaults of every
+// section but the ones in setOnDemand.
+func newFileContent() ([]byte, error) {
+	var doc yaml.Node
+	if err := doc.Encode(DefaultConfig); err != nil {
+		return nil, err
+	}
+	var kept []*yaml.Node
+	for i := 0; i+1 < len(doc.Content); i += 2 {
+		if !setOnDemand[doc.Content[i].Value] {
+			kept = append(kept, doc.Content[i], doc.Content[i+1])
+		}
+	}
+	doc.Content = kept
+	return yaml.Marshal(&doc)
+}
+
+func NewConfigWithPath(p string) (*Config, error) {
+	if !util.FileExists(p) {
+		content, err := newFileContent()
+		if err == nil {
+			_ = os.WriteFile(p, content, 0666)
+			return DefaultConfig, nil
+		}
+	}
+	_ = util.ChangeModeIfNot(p, 0666)
+	content, err := os.ReadFile(p)
+	if err != nil {
+		return nil, err
+	}
+	config, err := decodeConfig(content)
+	if err != nil {
+		return nil, err
+	}
+	if config.Plugin.HTTP == nil {
+		config.Plugin.HTTP = &HTTP{}
+	}
+	if config.Proxy == nil {
+		config.Proxy = EmptyProxy
+	}
+	if config.Storage == nil {
+		config.Storage = EmptyStorage
+	}
+	if config.Registry == nil {
+		config.Registry = EmptyRegistry
+	}
+	if config.LegacyVersionFile == nil {
+		config.LegacyVersionFile = EmptyLegacyVersionFile
+	}
+	if config.Cache == nil {
+		config.Cache = EmptyCache
+	}
+	if config.Gitignore == nil {
+		config.Gitignore = EmptyGitignore
+	}
+	if config.Diagnostics == nil {
+		config.Diagnostics = EmptyDiagnostics
+	}
+	if config.Path == nil {
+		config.Path = EmptyPath
+	}
+	return config, nil
+
+}
+
+// decodeConfig reads what a config file holds and checks it, leaving the
+// sections the file does not declare nil. File uses it to refuse a change that
+// would leave a file vfox cannot load.
+func decodeConfig(content []byte) (*Config, error) {
+	config := &Config{}
+	if err := yaml.Unmarshal(content, config); err != nil {
+		return nil, err
+	}
+	if err := config.Plugin.HTTP.Validate(); err != nil {
+		return nil, err
+	}
+	return config, nil
+}
+
+func NewConfig(path string) (*Config, error) {
+	p := filepath.Join(path, filename)
+	return NewConfigWithPath(p)
+}
+
+// SaveConfig writes every section of c to the config file in path. It is not how
+// vfox changes the user's file: that would declare the defaults and the shared
+// values as if the user had chosen them. Use File for that.
+func (c *Config) SaveConfig(path string) error {
+	if err := c.Plugin.HTTP.Validate(); err != nil {
+		return err
+	}
+	p := filepath.Join(path, filename)
+	content, err := yaml.Marshal(c)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(p, content, os.ModePerm)
+}
+
+// Merge merges two configs with userConfig taking precedence over sharedConfig
+// Returns a new config where userConfig fields override sharedConfig fields
+// If a field in userConfig is nil/empty, the sharedConfig value is used
+func Merge(sharedConfig, userConfig *Config) *Config {
+	if sharedConfig == nil && userConfig == nil {
+		return DefaultConfig
+	}
+	if sharedConfig == nil {
+		return ensureDefaults(userConfig)
+	}
+	if userConfig == nil {
+		return ensureDefaults(sharedConfig)
+	}
+
+	result := &Config{Plugin: Plugin{HTTP: mergeHTTP(sharedConfig.Plugin.HTTP, userConfig.Plugin.HTTP)}}
+
+	// Merge Proxy: user overrides shared
+	// Note: userConfig.Proxy may be nil, which means "use shared"
+	result.Proxy = mergeProxy(sharedConfig.Proxy, userConfig.Proxy)
+
+	// Merge Storage: user overrides shared
+	result.Storage = mergeStorage(sharedConfig.Storage, userConfig.Storage)
+
+	// Merge Registry: user overrides shared
+	result.Registry = mergeRegistry(sharedConfig.Registry, userConfig.Registry)
+
+	// Merge LegacyVersionFile: user overrides shared
+	result.LegacyVersionFile = mergeLegacyVersionFile(sharedConfig.LegacyVersionFile, userConfig.LegacyVersionFile)
+
+	// Merge Cache: user overrides shared
+	result.Cache = mergeCache(sharedConfig.Cache, userConfig.Cache)
+
+	// Merge Gitignore: user overrides shared
+	result.Gitignore = mergeGitignore(sharedConfig.Gitignore, userConfig.Gitignore)
+
+	// Merge Diagnostics and Path: user overrides shared
+	result.Diagnostics = mergeDiagnostics(sharedConfig.Diagnostics, userConfig.Diagnostics)
+	result.Path = mergePath(sharedConfig.Path, userConfig.Path)
+
+	// Merge Aliases: entries of both are kept, the user wins on a clash
+	result.Aliases = mergeAliases(sharedConfig.Aliases, userConfig.Aliases)
+
+	// Apply defaults to any remaining nil fields
+	return ensureDefaults(result)
+}
+
+// ensureDefaults ensures that all nil fields are replaced with empty defaults
+func ensureDefaults(c *Config) *Config {
+	if c == nil {
+		return DefaultConfig
+	}
+	if c.Plugin.HTTP == nil {
+		c.Plugin.HTTP = &HTTP{}
+	}
+	if c.Proxy == nil {
+		c.Proxy = EmptyProxy
+	}
+	if c.Storage == nil {
+		c.Storage = EmptyStorage
+	}
+	if c.Registry == nil {
+		c.Registry = EmptyRegistry
+	}
+	if c.LegacyVersionFile == nil {
+		c.LegacyVersionFile = EmptyLegacyVersionFile
+	}
+	if c.Cache == nil {
+		c.Cache = EmptyCache
+	}
+	if c.Gitignore == nil {
+		c.Gitignore = EmptyGitignore
+	}
+	if c.Diagnostics == nil {
+		c.Diagnostics = EmptyDiagnostics
+	}
+	if c.Path == nil {
+		c.Path = EmptyPath
+	}
+	return c
+}
+
+// mergeProxy merges proxy configs with user taking precedence
+// If user config is not nil, it means user explicitly set proxy settings
+// (even if just to disable it), so use user config
+func mergeProxy(shared, user *Proxy) *Proxy {
+	if user != nil {
+		return user
+	}
+	if shared != nil {
+		return shared
+	}
+	return EmptyProxy
+}
+
+// mergeStorage merges storage configs with user taking precedence
+func mergeStorage(shared, user *Storage) *Storage {
+	if user != nil && !isStorageEmpty(user) {
+		return user
+	}
+	if shared != nil {
+		return shared
+	}
+	return EmptyStorage
+}
+
+// mergeRegistry merges registry configs with user taking precedence
+func mergeRegistry(shared, user *Registry) *Registry {
+	if user != nil && !isRegistryEmpty(user) {
+		return user
+	}
+	if shared != nil {
+		return shared
+	}
+	return EmptyRegistry
+}
+
+// mergeLegacyVersionFile merges legacy version file configs with user taking precedence
+func mergeLegacyVersionFile(shared, user *LegacyVersionFile) *LegacyVersionFile {
+	if user != nil && !isLegacyVersionFileEmpty(user) {
+		return user
+	}
+	if shared != nil {
+		return shared
+	}
+	return EmptyLegacyVersionFile
+}
+
+// mergeCache merges cache configs with user taking precedence
+// Special case: EmptyCache (12h default) is considered "unset" if shared has a different value
+func mergeCache(shared, user *Cache) *Cache {
+	if user == nil {
+		if shared != nil {
+			return shared
+		}
+		return EmptyCache
+	}
+	// User config exists, check if it's the default EmptyCache
+	if shared != nil && user.AvailableHookDuration == EmptyCache.AvailableHookDuration {
+		// User has default cache duration, but shared has something different, use shared
+		if shared.AvailableHookDuration != EmptyCache.AvailableHookDuration {
+			return shared
+		}
+	}
+	// User has a non-default cache setting, or both are default
+	return user
+}
+
+// mergeGitignore merges gitignore configs with user taking precedence.
+// If user config is non-nil, it is used as-is (so users can explicitly
+// disable the auto-update by setting enable: false).
+func mergeGitignore(shared, user *Gitignore) *Gitignore {
+	if user != nil {
+		return user
+	}
+	if shared != nil {
+		return shared
+	}
+	return EmptyGitignore
+}
+
+// mergeDiagnostics merges diagnostics configs. A section the user's file
+// declares replaces the shared one; NewConfigWithPath hands out EmptyDiagnostics
+// itself for a file without the section, so pointer identity tells them apart.
+func mergeDiagnostics(shared, user *Diagnostics) *Diagnostics {
+	if user != nil && user != EmptyDiagnostics {
+		return user
+	}
+	if shared != nil {
+		return shared
+	}
+	return EmptyDiagnostics
+}
+
+// mergePath merges PATH ordering configs, with the same rules as mergeDiagnostics.
+func mergePath(shared, user *Path) *Path {
+	if user != nil && user != EmptyPath {
+		return user
+	}
+	if shared != nil {
+		return shared
+	}
+	return EmptyPath
+}
+
+// mergeAliases keeps the aliases of both configs; the user wins on a clash.
+func mergeAliases(shared, user map[string]map[string]string) map[string]map[string]string {
+	if len(shared) == 0 && len(user) == 0 {
+		return nil
+	}
+	merged := cloneAliases(shared)
+	if merged == nil {
+		merged = make(map[string]map[string]string)
+	}
+	for sdk, names := range user {
+		if merged[sdk] == nil {
+			merged[sdk] = make(map[string]string, len(names))
+		}
+		for name, version := range names {
+			merged[sdk][name] = version
+		}
+	}
+	return merged
+}
+
+// Helper functions to check if config is empty
+// A config is considered empty if it's nil or all fields are at default/zero values
+func isProxyEmpty(p *Proxy) bool {
+	if p == nil {
+		return true
+	}
+	// If proxy is explicitly disabled with no other settings, it's not empty
+	// (user wants to disable proxy)
+	if !p.Enable && p.Url == "" {
+		return true
+	}
+	return false
+}
+
+func isStorageEmpty(s *Storage) bool {
+	return s == nil || s.SdkPath == ""
+}
+
+func isRegistryEmpty(r *Registry) bool {
+	return r == nil || r.Address == ""
+}
+
+func isLegacyVersionFileEmpty(l *LegacyVersionFile) bool {
+	return l == nil
+}
+
+func isCacheEmpty(c *Cache) bool {
+	return c == nil || c.AvailableHookDuration == 0
+}
+
+// LoadConfigWithFallback loads config from multiple paths with priority
+// Priority: sharedPath (higher) > userPath (lower)
+// If sharedPath doesn't exist or is empty, userConfig is used
+// If both exist, they are merged with userConfig taking precedence for non-empty fields
+func LoadConfigWithFallback(sharedPath, userPath string) (*Config, error) {
+	var sharedConfig, userConfig *Config
+	var err error
+
+	// Load shared config (optional)
+	if sharedPath != "" && util.FileExists(sharedPath) {
+		sharedConfig, err = NewConfigWithPath(sharedPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load shared config from %s: %w", sharedPath, err)
+		}
+	}
+
+	// Load user config (required - created if missing)
+	userConfig, err = NewConfigWithPath(userPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load user config from %s: %w", userPath, err)
+	}
+
+	// Merge configs (user overrides shared)
+	return Merge(sharedConfig, userConfig), nil
+}

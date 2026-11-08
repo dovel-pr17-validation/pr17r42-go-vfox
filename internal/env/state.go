@@ -1,0 +1,266 @@
+/*
+ *    Copyright 2026 Han Li and contributors
+ *
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *    Unless required by applicable law or agreed to in writing, software
+ *    distributed under the License is distributed on an "AS IS" BASIS,
+ *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *    See the License for the specific language governing permissions and
+ *    limitations under the License.
+ */
+
+package env
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ConfigState tracks the state of configuration files for diff checking
+type ConfigState struct {
+	mu sync.RWMutex
+
+	// Last check time (Unix timestamp in seconds)
+	LastCheck int64 `json:"last_check"`
+
+	// Current project config path (to detect directory/project changes)
+	CurrentProjectPath string `json:"current_project_path,omitempty"`
+
+	// Config file modification times (Unix timestamps in nanoseconds)
+	GlobalMtime  int64 `json:"global_mtime,omitempty"`
+	SessionMtime int64 `json:"session_mtime,omitempty"`
+	ProjectMtime int64 `json:"project_mtime,omitempty"`
+
+	// Cached PATH value (to detect user-made PATH changes)
+	CachedPath string `json:"cached_path,omitempty"`
+
+	// PATH ordering policy (see RuntimeEnvContext.PathPolicyKey) the cached
+	// output was rendered with. Changing `path.mode` or `path.preserve` must not
+	// keep serving output rendered under the old one: config.yaml is not among
+	// the files whose modification time is tracked.
+	CachedPathPolicy string `json:"cached_path_policy,omitempty"`
+
+	// Key of the inputs the output was resolved from that are not tracked
+	// config files: the project SDK directory and the project tools, including
+	// those read from legacy version files (.nvmrc and the like), a stamp of
+	// the installed versions and plugins, and which of the links the output
+	// points at exist. A different key means the cached output is stale.
+	CachedResolutionKey string `json:"cached_resolution_key,omitempty"`
+
+	// Target shell used to render CachedOutput. Empty for legacy cache files.
+	CachedShell string `json:"cached_shell,omitempty"`
+
+	// Cached env output (shell script)
+	CachedOutput string `json:"cached_output,omitempty"`
+
+	// State file path
+	stateFilePath string
+}
+
+// NewConfigState creates a new ConfigState with the given state file path
+func NewConfigState(stateFilePath string) *ConfigState {
+	return &ConfigState{
+		stateFilePath: stateFilePath,
+		LastCheck:     0,
+	}
+}
+
+// Load loads the state from disk
+func (s *ConfigState) Load() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data, err := os.ReadFile(s.stateFilePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// State file doesn't exist yet, that's ok
+			return nil
+		}
+		return err
+	}
+
+	// Directly unmarshal into the state struct
+	return json.Unmarshal(data, s)
+}
+
+// Save saves the state to disk
+func (s *ConfigState) Save() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveLocked()
+}
+
+// saveLocked saves the state to disk (caller must hold lock)
+func (s *ConfigState) saveLocked() error {
+	// Ensure directory exists
+	if err := os.MkdirAll(filepath.Dir(s.stateFilePath), 0755); err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(s.stateFilePath, data, 0644)
+}
+
+// HasChanged checks if any config file has changed based on modification time
+// Returns true if any config file has been modified since last check, or if project directory changed, or if PATH changed
+func (s *ConfigState) HasChanged(configPaths map[UseScope]string) (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// Check if project path changed (directory changed)
+	currentProjectPath := configPaths[Project]
+	if currentProjectPath != s.CurrentProjectPath {
+		// Project directory or config file changed
+		return true, nil
+	}
+
+	// Check if PATH has changed since last cache
+	currentPath := os.Getenv(PathVarName)
+	if currentPath != s.CachedPath {
+		// User has modified PATH since last cache
+		return true, nil
+	}
+
+	// Check each config file
+	for scope, path := range configPaths {
+		if path == "" {
+			continue
+		}
+
+		mtime, err := getFileModTime(path)
+		if err != nil {
+			// File doesn't exist or can't be read
+			if os.IsNotExist(err) {
+				// File was deleted, consider it as changed
+				return true, nil
+			}
+			return false, err
+		}
+
+		// Compare with stored mtime
+		var storedMtime int64
+		switch scope {
+		case Global:
+			storedMtime = s.GlobalMtime
+		case Session:
+			storedMtime = s.SessionMtime
+		case Project:
+			storedMtime = s.ProjectMtime
+		}
+
+		// Any other time counts: a file replaced by an older one (mv of a
+		// backup, cp -p, an unpacked archive) has moved back.
+		if mtime != storedMtime {
+			// File has been modified
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// PathPolicyChanged reports whether the cached output was rendered under a
+// different PATH ordering policy than policy.
+func (s *ConfigState) PathPolicyChanged(policy string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.CachedPathPolicy != policy
+}
+
+// SetPathPolicy records the PATH ordering policy of the output about to be
+// stored by Update.
+func (s *ConfigState) SetPathPolicy(policy string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.CachedPathPolicy = policy
+}
+
+// ResolutionKeyChanged reports whether the cached output was resolved under a
+// different key (see CachedResolutionKey) than key.
+func (s *ConfigState) ResolutionKeyChanged(key string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.CachedResolutionKey != key
+}
+
+// SetResolutionKey records the resolution key of the output about to be
+// stored by Update.
+func (s *ConfigState) SetResolutionKey(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.CachedResolutionKey = key
+}
+
+// Update updates the state with new config mtimes, current PATH, and cached output
+func (s *ConfigState) Update(configPaths map[UseScope]string, output, shellName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.LastCheck = time.Now().Unix()
+
+	// Update current project path
+	s.CurrentProjectPath = configPaths[Project]
+
+	// Update mtimes for all config files
+	for scope, path := range configPaths {
+		if path == "" {
+			continue
+		}
+
+		mtime, err := getFileModTime(path)
+		if err != nil {
+			// File doesn't exist, skip it
+			continue
+		}
+
+		switch scope {
+		case Global:
+			s.GlobalMtime = mtime
+		case Session:
+			s.SessionMtime = mtime
+		case Project:
+			s.ProjectMtime = mtime
+		}
+	}
+
+	// Store current PATH to detect user-made changes later
+	s.CachedPath = os.Getenv(PathVarName)
+	s.CachedOutput = output
+	s.CachedShell = strings.ToLower(shellName)
+
+	return s.saveLocked()
+}
+
+// GetCachedOutput returns output only for the requested shell. Legacy caches
+// without a shell must be regenerated.
+func (s *ConfigState) GetCachedOutput(shellName string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.CachedShell == "" || s.CachedShell != strings.ToLower(shellName) {
+		return ""
+	}
+	return s.CachedOutput
+}
+
+// getFileModTime returns the modification time of a file in Unix nanoseconds,
+// so that an edit within the second of the stored time is seen as well.
+func getFileModTime(path string) (int64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return info.ModTime().UnixNano(), nil
+}
